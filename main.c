@@ -67,6 +67,15 @@ void serialized_map(Map *map, FILE *f) {
   fprintf(f, "}");
 }
 
+static int cmp_entry(const void *a, const void *b) {
+  const Entry *ea = (const Entry *)a;
+  const Entry *eb = (const Entry *)b;
+  return strcmp(ea->key, eb->key);
+}
+void sort_map(Map *map) {
+  qsort(&map->buf, map->size, sizeof(Entry), cmp_entry);
+}
+
 void destroy_map(Map *map) {
   for (int j = 0; j < map->size; j++) {
     free(map->buf[j].key);
@@ -127,22 +136,26 @@ int bcr() {
 int main() {
   struct timespec start, end;
 
-  clock_gettime(CLOCK_MONOTONIC, &start);
-  bcr();
-  clock_gettime(CLOCK_MONOTONIC, &end);
-
   FILE *f_result = fopen("result.txt", "w");
   if (!f_result) {
     fprintf(stderr, "result opening error\n");
     return 1;
   }
 
-  double elapsed =
-      (end.tv_sec - start.tv_sec) * 1e3 + (end.tv_nsec - start.tv_nsec) * 1e-6;
-  fprintf(f_result, "Time:\n%.9fms\n", elapsed);
+  clock_gettime(CLOCK_MONOTONIC, &start);
+
+  bcr();
+
+  sort_map(&map);
 
   fprintf(f_result, "Result:\n");
   serialized_map(&map, f_result);
+
+  clock_gettime(CLOCK_MONOTONIC, &end);
+
+  double elapsed =
+      (end.tv_sec - start.tv_sec) * 1e3 + (end.tv_nsec - start.tv_nsec) * 1e-6;
+  fprintf(f_result, "\n\n====\n\nTime:\n%.9fms\n", elapsed);
 
   fclose(f_result);
   destroy_map(&map);
