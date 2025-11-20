@@ -1,10 +1,14 @@
 #include <bits/time.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define FILE_PATH "measurements.txt"
+#define BLOCK_SIZE (64 * 1024 * 1024) // 64MB
+char *block_buf;
 #define MAX_ENTRY 1000000
 #define MAX_STATION_LEN 100
 #define MAX_TEMP_LEN 100
@@ -82,55 +86,100 @@ void destroy_map(Map *map) {
   }
 }
 
-int bcr() {
-  FILE *f = fopen(FILE_PATH, "r");
-  if (!f) {
-    fprintf(stderr, "Unable to open file\n");
-    exit(1);
-  }
-
+void process_line(const char *line, int size) {
   char c;
-  int i;
-  int len;
+  int j = 0;
   char station[MAX_STATION_LEN];
   char temp[MAX_TEMP_LEN];
   int is_station = 1;
-  while ((c = fgetc(f)) != EOF) {
-    if (c == '\n') {
-      temp[i] = '\0';
-
-      char *end;
-      float value = strtof(temp, &end);
-
-      add_map(&map, (Entry){.min = value,
-                            .sum = value,
-                            .max = value,
-                            .count = 1,
-                            .key = station});
-
-      // reset
-      i = 0;
-      is_station = 1;
-      station[0] = '\0';
-      temp[0] = '\0';
-      continue;
-    }
-    if (c == ';') {
-      station[i++] = '\0';
+  for (int i = 0; i < size; i++) {
+    if (line[i] == ';') {
+      station[j++] = '\0';
       is_station = 0;
-      i = 0;
+      j = 0;
       continue;
     }
     //
     if (is_station) {
-      station[i++] = c;
+      station[j++] = line[i];
     } else {
-      temp[i++] = c;
+      temp[j++] = line[i];
+    }
+  }
+  temp[j] = '\0';
+
+  char *end;
+  float value = strtof(temp, &end);
+
+  add_map(&map, (Entry){.min = value,
+                        .sum = value,
+                        .max = value,
+                        .count = 1,
+                        .key = station});
+}
+
+void process_file(const char *file_path) {
+  int fd = open(FILE_PATH, O_RDONLY);
+  if (fd < 0) {
+    perror("open measurement file");
+    exit(1);
+  }
+
+  block_buf = malloc(BLOCK_SIZE + 1024);
+  if (!block_buf) {
+    perror("malloc block buffer");
+    exit(1);
+  }
+
+  int rem = 0;
+  while (1) {
+    int n = read(fd, block_buf + rem, BLOCK_SIZE);
+    if (n < 0) {
+      perror("read error");
+      exit(1);
+    }
+    if (n == 0 && rem == 0)
+      break;
+
+    int total = rem + n;
+
+    int last_nl = -1;
+
+    for (int i = total - 1; i >= 0; i--) { // check bound
+      if (block_buf[i] == '\n') {
+        last_nl = i;
+        break;
+      }
+    }
+
+    if (last_nl < 0) {
+      perror("line longer than buffer");
+      exit(1);
+    }
+
+    int start = 0;
+    for (int i = 0; i <= last_nl; i++) {
+      if (block_buf[i] == '\n') {
+        process_line(&block_buf[start], i - start); // exclude \n
+        start = i + 1;
+      }
+    }
+
+    rem = total - last_nl - 1;
+    memcpy(block_buf, block_buf + last_nl + 1,
+           rem); // quite a stretch, should be a memmove; supposed no overlap
+                 // (should be good on >16MB)
+
+    if (n == 0) {
+      if (rem > 0) {
+        process_line(block_buf, rem);
+      }
+      break;
     }
   }
 
-  fclose(f);
-  return 0;
+  close(fd);
+  free(block_buf);
 }
 
 int main() {
@@ -144,7 +193,7 @@ int main() {
 
   clock_gettime(CLOCK_MONOTONIC, &start);
 
-  bcr();
+  process_file(FILE_PATH);
 
   sort_map(&map);
 
