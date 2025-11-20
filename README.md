@@ -6,7 +6,7 @@ Each iteration will be tag. Each iteration result (output & elapsed time) can be
 ## Optimization
 
 - [x] optimized size buffer file read
-- [ ] convert float to int
+- [x] convert float to int
 - [ ] use hashmap
 - [ ] reduce CPU branching
 - [ ] eliminate use of key string dynamic allocation
@@ -15,7 +15,8 @@ Each iteration will be tag. Each iteration result (output & elapsed time) can be
 
 ## Logs
 
-- naive implementation: [@058a903](https://github.com/melvi-l/1bcr-c/blob/naive/result.txt)
+- naive implementation: [@058a903](https://github.com/melvi-l/1bcr-c/blob/naive/result.txt#L421)
+- manual file read: [@c6933ed](https://github.com/melvi-l/1bcr-c/blob/manual_read/result.txt#L421)
 
 ## TODO
 

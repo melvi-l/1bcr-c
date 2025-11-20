@@ -14,10 +14,10 @@ char *block_buf;
 #define MAX_TEMP_LEN 100
 
 typedef struct {
-  float min;
-  float sum;
-  float max;
-  float count;
+  int min;
+  int sum;
+  int max;
+  int count;
   char *key;
 } Entry;
 
@@ -29,16 +29,17 @@ typedef struct {
 
 Map map = {0, MAX_ENTRY};
 
-void add_map(Map *map, Entry entry) {
+void add_map(Map *map, const char *key, int key_len, int min, int sum, int max,
+             int count) {
   for (int j = 0; j < map->size; j++) {
-    if (!strcmp(map->buf[j].key, entry.key)) {
+    if (!strncmp(map->buf[j].key, key, key_len)) {
       // update
-      if (map->buf[j].min > entry.min)
-        map->buf[j].min = entry.min;
-      if (map->buf[j].max < entry.max)
-        map->buf[j].max = entry.max;
-      map->buf[j].count += entry.count;
-      map->buf[j].sum += entry.sum;
+      if (map->buf[j].min > min)
+        map->buf[j].min = min;
+      if (map->buf[j].max < max)
+        map->buf[j].max = max;
+      map->buf[j].count += count;
+      map->buf[j].sum += sum;
       return;
     }
   }
@@ -47,16 +48,13 @@ void add_map(Map *map, Entry entry) {
     exit(1);
   }
   // copy key
-  size_t len = strlen(entry.key);
-  char *key = malloc(len + 1);
-  memcpy(key, entry.key, len + 1);
+  char *_key = malloc(key_len + 1);
+  memcpy(_key, key, key_len);
+  _key[key_len] = '\0';
 
   // add
-  map->buf[map->size] = (Entry){.min = entry.min,
-                                .sum = entry.sum,
-                                .max = entry.max,
-                                .count = entry.count,
-                                .key = key};
+  map->buf[map->size] =
+      (Entry){.min = min, .sum = sum, .max = max, .count = count, .key = _key};
   map->size++;
 }
 
@@ -65,8 +63,10 @@ void serialized_map(Map *map, FILE *f) {
   fprintf(f, "{\n");
   for (int j = 0; j < map->size; j++) {
     Entry curr = map->buf[j];
-    float mean = curr.sum / curr.count;
-    fprintf(f, "\t%s=%f/%f/%f, \n", curr.key, curr.min, mean, curr.max);
+    int mean = curr.sum / curr.count;
+    fprintf(f, "\t%s=%d.%d/%d.%d/%d.%d, \n", curr.key, curr.min / 10,
+            abs(curr.min % 10), mean / 10, abs(mean % 10), curr.max / 10,
+            abs(curr.max % 10));
   }
   fprintf(f, "}");
 }
@@ -87,35 +87,39 @@ void destroy_map(Map *map) {
 }
 
 void process_line(const char *line, int size) {
-  char c;
-  int j = 0;
-  char station[MAX_STATION_LEN];
   char temp[MAX_TEMP_LEN];
   int is_station = 1;
-  for (int i = 0; i < size; i++) {
-    if (line[i] == ';') {
-      station[j++] = '\0';
-      is_station = 0;
-      j = 0;
-      continue;
-    }
-    //
-    if (is_station) {
-      station[j++] = line[i];
-    } else {
-      temp[j++] = line[i];
-    }
+  int i = 0;
+  while (i < size && line[i] != ';') {
+    i++;
   }
-  temp[j] = '\0';
 
-  char *end;
-  float value = strtof(temp, &end);
+  int station_len = i;
+  i++;
 
-  add_map(&map, (Entry){.min = value,
-                        .sum = value,
-                        .max = value,
-                        .count = 1,
-                        .key = station});
+  int neg = 0;
+  if (line[i] == '-') {
+    // printf("neg");
+    neg = 1;
+    i++;
+  }
+
+  int val = 0;
+  while (i < size && line[i] != '.') {
+    val = val * 10 + (line[i] - '0');
+    i++;
+  }
+
+  if (line[i] == '.') {
+    i++;
+    val = val * 10 + (line[i] - '0');
+  }
+
+  if (neg)
+    val = -val;
+
+  // printf("%.*s -- %i\n", station_len, line, val);
+  add_map(&map, line, station_len, val, val, val, 1);
 }
 
 void process_file(const char *file_path) {
