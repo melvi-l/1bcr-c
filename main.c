@@ -10,15 +10,10 @@
 #include <stdlib.h>
 
 #define FILE_PATH "measurements.txt"
-#define BLOCK_SIZE (64 * 1024 * 1024) // 64MB
-char *block_buf;
-#define MAX_ENTRY 1000000
-#define MAX_STATION_LEN 100
-#define MAX_TEMP_LEN 100
 
 #define HASH_MULT 257
 #define HASH_SEED 146527
-#define HASH_MAP_CAPACITY 4096 // >= 8 * ~400 stations
+#define HASH_MAP_CAPACITY 16384 // >= 8 * ~400 stations
 
 typedef struct {
   uint64_t hash;   // 8B
@@ -41,14 +36,6 @@ typedef struct {
 
 // open addressing map
 static Entry map[HASH_MAP_CAPACITY];
-
-// mult hash -> simple and fast
-static inline uint64_t hash_fn(const char *k, int len) {
-  uint64_t h = HASH_SEED;
-  for (int i = 0; i < len; i++) // should be compute at parsing time
-    h = h * 131 + (unsigned char)k[i];
-  return h;
-}
 
 static inline int key_equals(Key *k, const char *ptr, int len) {
   return (k->len == len) && (memcmp(k->ptr, ptr, len) == 0);
@@ -150,8 +137,12 @@ void serialized_map(FILE *f) {
 
 static inline void process_line(const char *line, int size) {
   const char *p = line;
-  while (*p != ';')
+
+  uint64_t hash = HASH_SEED;
+  while (*p != ';') {
+    hash = (hash << 5) - hash + (unsigned char)*p;
     p++;
+  }
   int station_len = p - line;
   p++;
 
@@ -169,7 +160,6 @@ static inline void process_line(const char *line, int size) {
   if (neg)
     val = -val;
 
-  int hash = hash_fn(line, station_len);
   insert_map(line, station_len, hash, val);
 }
 
