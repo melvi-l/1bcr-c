@@ -1,10 +1,13 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <bits/time.h>
 #include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
 #include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
 
 #define FILE_PATH "measurements.txt"
 #define BLOCK_SIZE (64 * 1024 * 1024) // 64MB
@@ -13,115 +16,165 @@ char *block_buf;
 #define MAX_STATION_LEN 100
 #define MAX_TEMP_LEN 100
 
+#define HASH_MULT 257
+#define HASH_SEED 146527
+#define HASH_MAP_CAPACITY 4096 // >= 8 * ~400 stations
+
 typedef struct {
-  int min;
-  int sum;
-  int max;
-  int count;
-  char *key;
+  uint64_t hash;   // 8B
+  const char *ptr; // 8B
+  int len;         // 4B
+} Key;
+
+typedef struct {
+  int min;   // 4B
+  int sum;   // 4B
+  int max;   // 4B
+  int count; // 4B
+} Value;
+
+typedef struct {
+  Key key;     // 24B
+  Value value; // 16B
+  int used;    // 4B
 } Entry;
 
-typedef struct {
-  int size;
-  int capacity;
-  Entry buf[MAX_ENTRY];
-} Map;
+// open addressing map
+static Entry map[HASH_MAP_CAPACITY];
 
-Map map = {0, MAX_ENTRY};
-
-void add_map(Map *map, const char *key, int key_len, int min, int sum, int max,
-             int count) {
-  for (int j = 0; j < map->size; j++) {
-    if (!strncmp(map->buf[j].key, key, key_len)) {
-      // update
-      if (map->buf[j].min > min)
-        map->buf[j].min = min;
-      if (map->buf[j].max < max)
-        map->buf[j].max = max;
-      map->buf[j].count += count;
-      map->buf[j].sum += sum;
-      return;
-    }
-  }
-  if (map->size >= map->capacity) {
-    fprintf(stderr, "Map overflow\n");
-    exit(1);
-  }
-  // copy key
-  char *_key = malloc(key_len + 1);
-  memcpy(_key, key, key_len);
-  _key[key_len] = '\0';
-
-  // add
-  map->buf[map->size] =
-      (Entry){.min = min, .sum = sum, .max = max, .count = count, .key = _key};
-  map->size++;
+// mult hash -> simple and fast
+static inline uint64_t hash_fn(const char *k, int len) {
+  uint64_t h = HASH_SEED;
+  for (int i = 0; i < len; i++) // should be compute at parsing time
+    h = h * 131 + (unsigned char)k[i];
+  return h;
 }
 
-void serialized_map(Map *map, FILE *f) {
+static inline int key_equals(Key *k, const char *ptr, int len) {
+  return (k->len == len) && (memcmp(k->ptr, ptr, len) == 0);
+}
 
-  fprintf(f, "{\n");
-  for (int j = 0; j < map->size; j++) {
-    Entry curr = map->buf[j];
-    int mean = curr.sum / curr.count;
-    fprintf(f, "\t%s=%d.%d/%d.%d/%d.%d, \n", curr.key, curr.min / 10,
-            abs(curr.min % 10), mean / 10, abs(mean % 10), curr.max / 10,
-            abs(curr.max % 10));
+static uint64_t total_inserts = 0;
+static uint64_t total_probes = 0;
+static uint64_t total_insert_probes = 0;
+static uint64_t total_collisions = 0;
+static inline void insert_map(const char *ptr, int len, uint64_t hash,
+                              int temperature) {
+
+  total_inserts++;
+
+  uint64_t index =
+      hash & (HASH_MAP_CAPACITY - 1); // hash % capacity si non puissance 2
+  uint64_t probes = 0;
+
+  while (1) {
+    Entry *e = &map[index];
+
+    // insert
+    if (!e->used) {
+      e->used = 1;
+      e->key.ptr = ptr;
+      e->key.len = len;
+      e->key.hash = hash;
+      e->value.min = temperature;
+      e->value.max = temperature;
+      e->value.sum = temperature;
+      e->value.count = 1;
+
+      total_probes += probes;
+      total_insert_probes += probes;
+      return;
+    }
+
+    // if hit -> collision check
+    if (e->key.hash == hash && key_equals(&e->key, ptr, len)) {
+      // ifn collision -> update
+      if (temperature < e->value.min)
+        e->value.min = temperature;
+      if (temperature > e->value.max)
+        e->value.max = temperature;
+      e->value.sum += temperature;
+      e->value.count++;
+
+      total_probes += probes;
+      return;
+    }
+
+    total_collisions++;
+    // else -> linear probing
+    probes++;
+    index = (index + 1) & (HASH_MAP_CAPACITY - 1);
   }
-  fprintf(f, "}");
 }
 
 static int cmp_entry(const void *a, const void *b) {
   const Entry *ea = (const Entry *)a;
   const Entry *eb = (const Entry *)b;
-  return strcmp(ea->key, eb->key);
+
+  const Key *ka = &ea->key;
+  const Key *kb = &eb->key;
+
+  int min_len = (ka->len < kb->len ? ka->len : kb->len);
+
+  // compare common bytes
+  int r = memcmp(ka->ptr, kb->ptr, min_len);
+  if (r != 0)
+    return r;
+
+  // sort by len
+  return ka->len - kb->len;
 }
-void sort_map(Map *map) {
-  qsort(&map->buf, map->size, sizeof(Entry), cmp_entry);
+
+void serialized_map(FILE *f) {
+  Entry result[HASH_MAP_CAPACITY];
+  // printf("start serialized_map\n");
+  int j = 0;
+  for (int i = 0; i < HASH_MAP_CAPACITY; i++) {
+    // printf("%i === %lu -> %i\n", j, map[i].key.hash, map[i].value.sum);
+    if (map[i].used) {
+      result[j++] = map[i];
+    }
+  }
+  qsort(result, j, sizeof(Entry), cmp_entry);
+
+  fprintf(f, "{\n");
+  for (int i = 0; i < j; i++) {
+    Entry e = result[i];
+    int mean = e.value.sum / e.value.count;
+    fprintf(f, "\t%.*s=%d.%d/%d.%d/%d.%d, \n", e.key.len, e.key.ptr,
+            e.value.min / 10, abs(e.value.min % 10), mean / 10, abs(mean % 10),
+            e.value.max / 10, abs(e.value.max % 10));
+  }
+  fprintf(f, "}");
 }
 
-void destroy_map(Map *map) {
-  for (int j = 0; j < map->size; j++) {
-    free(map->buf[j].key);
-  }
-}
+static inline void process_line(const char *line, int size) {
+  const char *p = line;
+  while (*p != ';')
+    p++;
+  int station_len = p - line;
+  p++;
 
-void process_line(const char *line, int size) {
-  char temp[MAX_TEMP_LEN];
-  int is_station = 1;
-  int i = 0;
-  while (i < size && line[i] != ';') {
-    i++;
-  }
+  int neg = (*p == '-');
+  p += neg;
 
-  int station_len = i;
-  i++;
+  int val = (p[0] - '0') * 10 + (p[1] - '0');
+  p += 2;
 
-  int neg = 0;
-  if (line[i] == '-') {
-    // printf("neg");
-    neg = 1;
-    i++;
-  }
-
-  int val = 0;
-  while (i < size && line[i] != '.') {
-    val = val * 10 + (line[i] - '0');
-    i++;
-  }
-
-  if (line[i] == '.') {
-    i++;
-    val = val * 10 + (line[i] - '0');
+  if (*p == '.') {
+    p++;
+    val = val * 10 + (*p - '0');
   }
 
   if (neg)
     val = -val;
 
-  // printf("%.*s -- %i\n", station_len, line, val);
-  add_map(&map, line, station_len, val, val, val, 1);
+  int hash = hash_fn(line, station_len);
+  insert_map(line, station_len, hash, val);
 }
 
+char *data;
+size_t size;
 void process_file(const char *file_path) {
   int fd = open(FILE_PATH, O_RDONLY);
   if (fd < 0) {
@@ -129,61 +182,34 @@ void process_file(const char *file_path) {
     exit(1);
   }
 
-  block_buf = malloc(BLOCK_SIZE + 1024);
-  if (!block_buf) {
-    perror("malloc block buffer");
+  struct stat st;
+  if (fstat(fd, &st) < 0) {
+    perror("fstat error");
+    close(fd);
+    exit(1);
+  }
+  size = st.st_size;
+
+  data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+  if (data == MAP_FAILED) {
+    perror("mmap error");
+    close(fd);
     exit(1);
   }
 
-  int rem = 0;
-  while (1) {
-    int n = read(fd, block_buf + rem, BLOCK_SIZE);
-    if (n < 0) {
-      perror("read error");
-      exit(1);
-    }
-    if (n == 0 && rem == 0)
-      break;
-
-    int total = rem + n;
-
-    int last_nl = -1;
-
-    for (int i = total - 1; i >= 0; i--) { // check bound
-      if (block_buf[i] == '\n') {
-        last_nl = i;
-        break;
-      }
-    }
-
-    if (last_nl < 0) {
-      perror("line longer than buffer");
-      exit(1);
-    }
-
-    int start = 0;
-    for (int i = 0; i <= last_nl; i++) {
-      if (block_buf[i] == '\n') {
-        process_line(&block_buf[start], i - start); // exclude \n
-        start = i + 1;
-      }
-    }
-
-    rem = total - last_nl - 1;
-    memcpy(block_buf, block_buf + last_nl + 1,
-           rem); // quite a stretch, should be a memmove; supposed no overlap
-                 // (should be good on >16MB)
-
-    if (n == 0) {
-      if (rem > 0) {
-        process_line(block_buf, rem);
-      }
-      break;
-    }
-  }
-
   close(fd);
-  free(block_buf);
+
+  size_t start = 0;
+  char *p = data;
+  char *end = data + size;
+  while (p < end) {
+    char *nl = memchr(p, '\n', end - p);
+    if (!nl)
+      break;
+    process_line(p, nl - p);
+    p = nl + 1;
+  }
 }
 
 int main() {
@@ -199,10 +225,8 @@ int main() {
 
   process_file(FILE_PATH);
 
-  sort_map(&map);
-
   fprintf(f_result, "Result:\n");
-  serialized_map(&map, f_result);
+  serialized_map(f_result);
 
   clock_gettime(CLOCK_MONOTONIC, &end);
 
@@ -210,7 +234,13 @@ int main() {
       (end.tv_sec - start.tv_sec) * 1e3 + (end.tv_nsec - start.tv_nsec) * 1e-6;
   fprintf(f_result, "\n\n====\n\nTime:\n%.9fms\n", elapsed);
 
+  printf("Hashmap inserts: %lu\n", total_inserts);
+  printf("Hashmap collisions: %lu\n", total_collisions);
+  printf("Hashmap total probes: %lu\n", total_probes);
+  printf("Hashmap total insert probes: %lu\n", total_insert_probes);
+  printf("Average probes per insert: %.4f\n",
+         (double)total_probes / total_inserts);
+
   fclose(f_result);
-  destroy_map(&map);
   return 0;
 }
